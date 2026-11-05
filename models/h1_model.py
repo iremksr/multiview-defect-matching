@@ -15,12 +15,15 @@ class H1Model(nn.Module):
 
     Inputs:
         images: [B, V, 1, H, W]
+
         boxes: nested list
-            boxes[b][v]: [N_bv, 4] in xyxy format
+            boxes[b][v]: [N_bv, 4]
+            Bounding boxes in xyxy pixel coordinates.
 
     Outputs:
-        matching logits and valid pair mask,
-        alongside embeddings and ROI metadata.
+        Matching logits, valid pair mask,
+        contextual embeddings, attention weights,
+        ROI metadata and geometry information.
     """
 
     def __init__(
@@ -39,15 +42,36 @@ class H1Model(nn.Module):
     ):
         super().__init__()
 
+        # --------------------------------------------------
+        # 1. Backbone: ResNet18 + FPN
+        # --------------------------------------------------
+
         self.backbone = MultiViewBackbone(
             pretrained=pretrained,
             freeze_backbone=freeze_backbone,
             out_channels=fpn_channels,
         )
 
+        # --------------------------------------------------
+        # 2. Multi-scale ROI Context
+        # --------------------------------------------------
+
         self.roi_context = MultiScaleROIContext()
 
-        self.context_fusion = ContextFusion()
+        # --------------------------------------------------
+        # 3. Context Fusion
+        # --------------------------------------------------
+
+        self.context_fusion = ContextFusion(
+            in_channels=fpn_channels,
+            embedding_dim=embedding_dim,
+            num_contexts=9,
+            dropout=dropout,
+        )
+
+        # --------------------------------------------------
+        # 4. Multi-View Transformer
+        # --------------------------------------------------
 
         self.transformer = MultiViewTransformer(
             embedding_dim=embedding_dim,
@@ -58,6 +82,10 @@ class H1Model(nn.Module):
             use_geometry=use_geometry,
         )
 
+        # --------------------------------------------------
+        # 5. Matching Head
+        # --------------------------------------------------
+
         self.matching_head = MatchingHead(
             embedding_dim=embedding_dim,
             projection_dim=projection_dim,
@@ -67,22 +95,30 @@ class H1Model(nn.Module):
     @staticmethod
     def normalize_boxes(boxes, metadata, image_size):
         """
-        Convert xyxy boxes to normalized cxcywh.
+        Convert xyxy pixel coordinates to normalized cxcywh.
 
         Args:
             boxes:
                 boxes[b][v]: [N_bv, 4]
 
             metadata:
-                [N, 3] (batch_id, view_index, box_index)
+                [N, 3] containing
+                (batch_id, view_index, box_index)
 
             image_size:
                 (H, W)
 
         Returns:
-            normalized_boxes: [N, 4]
+            normalized_boxes:
+                [N, 4] containing
+                (cx, cy, width, height)
+                normalized to [0, 1]
         """
+
         H, W = image_size
+
+        if H <= 0 or W <= 0:
+            raise ValueError("Invalid image size")
 
         if metadata.numel() == 0:
             return torch.empty(
@@ -94,32 +130,49 @@ class H1Model(nn.Module):
         normalized = []
 
         for batch_id, view_id, box_id in metadata.tolist():
+
             box = boxes[batch_id][view_id][box_id]
+
+            box = torch.as_tensor(
+                box,
+                dtype=torch.float32,
+                device=metadata.device,
+            )
 
             x1, y1, x2, y2 = box.unbind()
 
-            normalized.append(
-                torch.stack([
-                    (x1 + x2) / (2 * W),
-                    (y1 + y2) / (2 * H),
-                    (x2 - x1) / W,
-                    (y2 - y1) / H,
-                ])
+            cx = (x1 + x2) / (2.0 * W)
+            cy = (y1 + y2) / (2.0 * H)
+
+            width = (x2 - x1) / W
+            height = (y2 - y1) / H
+
+            normalized_box = torch.stack(
+                [cx, cy, width, height]
             )
 
-        return torch.stack(normalized).to(
-            device=metadata.device
-        )
+            normalized.append(normalized_box)
+
+        return torch.stack(normalized, dim=0)
 
     def forward(self, images, boxes):
         """
         Args:
-            images: [B, V, 1, H, W]
-            boxes: nested list [B][V]
+            images:
+                [B, V, 1, H, W]
+
+            boxes:
+                Nested list [B][V].
+                Each element is [N_bv, 4].
 
         Returns:
-            Dictionary containing matching predictions.
+            Dictionary with model outputs.
         """
+
+        # --------------------------------------------------
+        # Input validation
+        # --------------------------------------------------
+
         if images.ndim != 5:
             raise ValueError(
                 "images must have shape [B, V, 1, H, W]"
@@ -137,29 +190,71 @@ class H1Model(nn.Module):
                 "boxes must contain B samples"
             )
 
-        # 1. Backbone + FPN
+        for b in range(B):
+            if len(boxes[b]) != V:
+                raise ValueError(
+                    f"Sample {b} has {len(boxes[b])} views, "
+                    f"but images contain {V} views"
+                )
+
+        # ==================================================
+        # STEP 1: Backbone + FPN
+        # ==================================================
+
         features = self.backbone(images)
 
-        # 2. Multi-scale ROI context
+        # features:
+        # {
+        #     "p2": [B, V, 128, H/4, W/4],
+        #     "p3": [B, V, 128, H/8, W/8],
+        #     "p4": [B, V, 128, H/16, W/16]
+        # }
+
+        # ==================================================
+        # STEP 2: Multi-Scale ROI Context
+        # ==================================================
+
         roi_features, metadata = self.roi_context(
             features,
             boxes,
             image_size=(H, W),
         )
 
-        # 3. Context fusion
-        embeddings = self.context_fusion(
+        # roi_features: [N, 9, 128, 7, 7]
+        # metadata: [N, 3]
+
+        # ==================================================
+        # STEP 3: Context Fusion
+        # ==================================================
+
+        embeddings, attention_weights = self.context_fusion(
             roi_features
         )
 
-        # 4. Normalize geometry in ROI order
+        # embeddings: [N, 256]
+        # attention_weights: [N, 9]
+
+        # ==================================================
+        # STEP 4: Normalize Bounding Box Geometry
+        # ==================================================
+
         normalized_boxes = self.normalize_boxes(
             boxes,
             metadata,
             image_size=(H, W),
         )
 
-        # 5. Multi-view Transformer
+        normalized_boxes = normalized_boxes.to(
+            device=embeddings.device,
+            dtype=embeddings.dtype,
+        )
+
+        # normalized_boxes: [N, 4]
+
+        # ==================================================
+        # STEP 5: Multi-View Transformer
+        # ==================================================
+
         (
             contextual_embeddings,
             padded_embeddings,
@@ -172,7 +267,15 @@ class H1Model(nn.Module):
             batch_size=B,
         )
 
-        # 6. Matching head
+        # contextual_embeddings: [N, 256]
+        # padded_embeddings: [B, Nmax, 256]
+        # padding_mask: [B, Nmax]
+        # padded_indices: [B, Nmax]
+
+        # ==================================================
+        # STEP 6: Matching Head
+        # ==================================================
+
         (
             matching_logits,
             valid_mask,
@@ -182,12 +285,21 @@ class H1Model(nn.Module):
             metadata,
         )
 
+        # matching_logits: [N, N]
+        # valid_mask: [N, N]
+        # projected_embeddings: [N, 128]
+
+        # ==================================================
+        # STEP 7: Return Outputs
+        # ==================================================
+
         return {
             "matching_logits": matching_logits,
             "valid_mask": valid_mask,
             "metadata": metadata,
             "normalized_boxes": normalized_boxes,
             "embeddings": embeddings,
+            "attention_weights": attention_weights,
             "contextual_embeddings": contextual_embeddings,
             "projected_embeddings": projected_embeddings,
             "padded_embeddings": padded_embeddings,
