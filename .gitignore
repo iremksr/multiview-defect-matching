@@ -1,0 +1,43 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and macOS
+.DS_Store
+.vscode/
+.idea/
+
+# Environment variables
+.env
+.env.*
+
+# Datasets
+data/
+datasets/raw/
+datasets/processed/
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# Training outputs
+runs/
+outputs/
+checkpoints/
+logs/
+wandb/
+tensorboard/
+
+# Jupyter
+.ipynb_checkpoints/
