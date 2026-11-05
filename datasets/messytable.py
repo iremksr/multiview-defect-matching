@@ -79,18 +79,84 @@ class MessyTableDataset(Dataset):
         }
 
 
+
 def messytable_collate_fn(batch):
+    """
+    Collate scenes with different numbers of views.
+
+    Pads the view dimension to the maximum number
+    of views in the current batch.
+
+    Images:       [B, Vmax, 1, H, W]
+    Boxes:        List[B][Vmax] -> Tensor[Ni, 4]
+    Instance IDs: List[B][Vmax] -> List[str]
+
+    Padded views contain zero images, empty boxes
+    and empty instance IDs.
+    """
+
+    import torch
+
+    max_views = max(
+        sample["images"].shape[0]
+        for sample in batch
+    )
+
+    padded_images = []
+    padded_boxes = []
+    padded_instance_ids = []
+    scene_ids = []
+
+    for sample in batch:
+
+        images = sample["images"]
+        boxes = list(sample["boxes"])
+        instance_ids = list(sample["instance_ids"])
+
+        num_views = images.shape[0]
+        missing_views = max_views - num_views
+
+        if missing_views > 0:
+
+            padding = torch.zeros(
+                (
+                    missing_views,
+                    images.shape[1],
+                    images.shape[2],
+                    images.shape[3],
+                ),
+                dtype=images.dtype,
+                device=images.device,
+            )
+
+            images = torch.cat(
+                [images, padding],
+                dim=0,
+            )
+
+            for _ in range(missing_views):
+
+                boxes.append(
+                    torch.empty(
+                        (0, 4),
+                        dtype=torch.float32,
+                    )
+                )
+
+                instance_ids.append([])
+
+        padded_images.append(images)
+        padded_boxes.append(boxes)
+        padded_instance_ids.append(instance_ids)
+        scene_ids.append(sample["scene_id"])
+
     return {
-        "images": torch.stack([
-            item["images"] for item in batch
-        ]),
-        "boxes": [
-            item["boxes"] for item in batch
-        ],
-        "instance_ids": [
-            item["instance_ids"] for item in batch
-        ],
-        "scene_ids": [
-            item["scene_id"] for item in batch
-        ],
+        "images": torch.stack(
+            padded_images,
+            dim=0,
+        ),
+        "boxes": padded_boxes,
+        "instance_ids": padded_instance_ids,
+        "scene_ids": scene_ids,
     }
+
