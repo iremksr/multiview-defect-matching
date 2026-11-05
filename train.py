@@ -186,13 +186,25 @@ def epoch_run(
 
                     scaler.scale(loss).backward()
 
+                    # Unscale gradients before clipping.
                     scaler.unscale_(optimizer)
 
-                    torch.nn.utils.clip_grad_norm_(
+                    # AMP can occasionally produce Inf/NaN gradients.
+                    # Do not raise here: GradScaler will detect them
+                    # and skip the unsafe optimizer step.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
                         max_norm=1.0,
-                        error_if_nonfinite=True,
+                        error_if_nonfinite=False,
                     )
+
+                    if not torch.isfinite(grad_norm):
+                        print(
+                            f"[AMP WARNING] Batch {batch_idx}: "
+                            "Non-finite gradients detected. "
+                            "GradScaler will skip this optimizer step.",
+                            flush=True,
+                        )
 
                     scaler.step(optimizer)
                     scaler.update()
